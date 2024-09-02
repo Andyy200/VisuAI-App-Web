@@ -1,7 +1,7 @@
 from flask import Flask, render_template, Response
 import argparse
 import cv2
-from ultralytics import YOLOv10
+from ultralytics import YOLO
 from threading import Thread
 import speech_recognition as sr
 import numpy as np
@@ -13,11 +13,14 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import pyttsx3
-from gtts import gTTS
+from flask import Flask, render_template, Response, request
 import os
+
+
 app = Flask(__name__)
 temp = "This is the first iteration of the response so ignore my instructions on repetition."
-camera_source = 0
+cap = None  # Initialize the cap variable
+model = YOLO('yolov10n.pt')  # Replace with the actual path to the YOLOv10 model
 
 
 def dir_scene(img_bytes):
@@ -33,7 +36,35 @@ def dir_scene(img_bytes):
 
     return response.choices[0].message.content
 
+def generate_frames():
+    global cap
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
+        # Use the YOLO model to detect objects in the frame
+        results = model(frame)
+        
+        # Draw bounding boxes on the detected objects
+        for result in results:
+            for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls):
+                # Extract bounding box coordinates
+                x1, y1, x2, y2 = map(int, box[:4])
+                confidence = conf.item()
+                class_id = int(cls.item())
+                class_name = model.names[class_id]
+                
+                # Draw the bounding box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"{class_name} {confidence:.2f}", 
+                            (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+        # Encode the frame as a JPEG image and yield it as a byte stream
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 def parse_arguments() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="YOLOv8 live")
   parser.add_argument(
@@ -198,20 +229,9 @@ def generate_scene_description(data_log, dir_log):
   temp = response.choices[0].message.content
   return temp
 def speak(text):
-    try:
-        # Try using pyttsx3 first
-        engine = pyttsx3.init()
-        engine.say(text)
-        engine.runAndWait()
-    except Exception as e:
-        print(f"pyttsx3 failed: {e}")
-        try:
-            # If pyttsx3 fails, use gTTS as a fallback
-            tts = gTTS(text=text, lang='en')
-            tts.save("output.mp3")
-            os.system("afplay output.mp3")  # Use afplay on macOS
-        except Exception as gtts_e:
-            print(f"gTTS also failed: {gtts_e}")
+    engine = pyttsx3.init()
+    engine.say(text) 
+    engine.runAndWait()
 
 def gptDirectory(text, results, model, cap, img_bytes):
    client = Client()
@@ -260,17 +280,15 @@ def emergency_contact():
     s.sendmail("sender_email_id", email, message) #We have to put our credentials in here (kinda risky) other side note: we can add a location feature just have to add to message.
     s.quit()
 def main():
-    global camera_source
-    speak("Hello I am VisuAI. I ill be your new eyes. If you have any questions, or want me to find an object, or have an emergency, just say hey vision.")
     args = parse_arguments()
     frame_width, frame_height = args.webcam_resolution
     h_fov = args.horizontal_fov
 
-    cap = cv2.VideoCapture(camera_source)
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
 
-    model = YOLOv10.from_pretrained('jameslahm/yolov10x')
+    model = YOLO('yolov10n.pt')  # Replace with the actual path to the YOLOv10 model
 
     last_data_log_time = time.time()
     last_dir_log_time = time.time()
@@ -305,7 +323,7 @@ def main():
                     dir_log += f"{time.strftime('%H:%M:%S', time.localtime())}: {dir_description}\n"
                     last_dir_log_time = current_time
 
-            if current_time - last_update_time >= 75:
+            if current_time - last_update_time >= 60:
                 scene_description = generate_scene_description(data_log, dir_log)
                 speak(scene_description)
                 print(scene_description)
@@ -320,7 +338,6 @@ def main():
         
         speak("speak now")
         text = get_audio()
-        
 
         if text.count(wake) > 0: # we can try to make this async
            speak("I am ready")
@@ -333,19 +350,63 @@ def main():
     cap.release()
 
 
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    return render_template('index.html', connected=False)
+
+
+@app.route('/connect', methods=['POST'])
+def connect():
+    global cap
+    rtsp_url = request.form['rtsp_url']
+    
+    # Release any previous capture if it exists
+    if cap is not None:
+        cap.release()
+    
+    # Initialize the video capture with the new RTSP URL
+    cap = cv2.VideoCapture(rtsp_url)
+    
+    # Check if the connection was successful
+    if not cap.isOpened():
+        return "Error: Unable to open video stream. Please check the URL and try again."
+    
+    return render_template('index.html', connected=True)
+
+
 @app.route('/video_feed')
 def video_feed():
-    render_template('camera.html')
-    return Response(main(), mimetype='multipart/x-mixed-replace; boundary=frame')
-@app.route('/')
-def index():
-    return render_template('index.html')
+    # Return the response generated along with the specific media type (mime type)
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/flip_camera', methods=['POST'])
-def flip_camera():
-    global camera_source
-    camera_source = 1 if camera_source == 0 else 0  # Toggle between 0 and 1
-    return '', 204
+@app.route('/use_device_camera', methods=['POST'])
+def use_device_camera():
+    global cap
+    
+    # Release any previous capture if it exists
+    if cap is not None:
+        cap.release()
+    
+    # Initialize the video capture with the device's default camera (typically webcam)
+    cap = cv2.VideoCapture(0)  # 0 is usually the default device camera
+    
+    # Check if the connection was successful
+    if not cap.isOpened():
+        return "Error: Unable to open device camera."
+    
+    return render_template('index.html', connected=True)
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000, debug=True)
+    try:
+        port = int(os.environ.get('PORT', 10000))
+        app.run(host='0.0.0.0', port=port, debug=True)
+    finally:
+        # Release the video capture when the app stops
+        if cap is not None:
+            cap.release()
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
